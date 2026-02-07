@@ -18,11 +18,10 @@ start_time = time.time()
 # --- CONFIGURAÇÕES ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Dispositivo: {device}")
-pasta = 'input_images_2'
+pasta = 'V3.A1'
 
-# --- REDUZI PARA 128x128 PARA EVITAR O CRASH DE MEMÓRIA ---
-IMG_HEIGHT = 128
-IMG_WIDTH = 128
+IMG_HEIGHT = 400
+IMG_WIDTH = 400
 IMG_CHANNELS = 3  # RGB
 FLAT_SIZE = IMG_HEIGHT * IMG_WIDTH * IMG_CHANNELS
 
@@ -122,7 +121,7 @@ optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 # --- ETAPA 4: TREINAMENTO ---
 print("\n--- Iniciando Treinamento ---")
-epochs = 20  # 20 épocas é suficiente para ver se funciona
+epochs = 5  # 20 épocas é suficiente para ver se funciona
 
 model.train()
 for i in range(epochs):
