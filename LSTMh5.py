@@ -1,4 +1,5 @@
 import matplotlib
+
 # Configura o matplotlib para rodar sem precisar de monitor/janela
 matplotlib.use('Agg')
 
@@ -8,7 +9,7 @@ from torch.utils.data import DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
 import os
-import h5py # Substitui PIL e torchvision
+import h5py
 import time
 
 start_time = time.time()
@@ -19,11 +20,11 @@ print(f"Dispositivo: {device}")
 
 ARQUIVO_H5 = 'dataset_axia_completo_2d.h5'
 
-# Dimensões exatas das matrizes salvas no HDF5 (sem RGB, apenas 1 canal térmico)
+# Dimensões exatas das matrizes salvas no HDF5
 IMG_HEIGHT = 480
 IMG_WIDTH = 640
 IMG_CHANNELS = 1
-FLAT_SIZE = IMG_HEIGHT * IMG_WIDTH * IMG_CHANNELS # 307.200
+FLAT_SIZE = IMG_HEIGHT * IMG_WIDTH * IMG_CHANNELS
 
 SEQ_LENGTH = 3
 BATCH_SIZE = 4
@@ -35,11 +36,7 @@ if not os.path.exists(ARQUIVO_H5):
     print(f"Ficheiro '{ARQUIVO_H5}' não encontrado.")
     exit()
 
-# Abre o HDF5 e carrega as matrizes
 with h5py.File(ARQUIVO_H5, 'r') as hf:
-    # Carrega os dados para a memória como float32
-    # Nota: Se o ficheiro for gigante (ex: >10GB), teríamos de usar um PyTorch Dataset para ler aos poucos.
-    # Para datasets normais, carregar tudo de uma vez é mais rápido.
     data_matrix = hf['matrizes_termicas'][:]
 
 print(f"Matrizes carregadas: {len(data_matrix)}")
@@ -48,18 +45,17 @@ if len(data_matrix) == 0:
     print("Nenhum dado válido encontrado no HDF5.")
     exit()
 
-# Converte para Tensor PyTorch
 data_tensor = torch.FloatTensor(data_matrix)
 
-# Normalização Térmica para [-1, 1] (Melhora o treino da LSTM)
-temp_min = data_tensor.min()
-temp_max = data_tensor.max()
-print(f"Temperatura Mínima: {temp_min:.2f} | Máxima: {temp_max:.2f}")
+# Guarda os valores originais para a desnormalização futura
+temp_min_orig = data_tensor.min().item()
+temp_max_orig = data_tensor.max().item()
+print(f"Temperatura Mínima Global: {temp_min_orig:.2f} | Máxima Global: {temp_max_orig:.2f}")
 
-data_tensor = 2 * ((data_tensor - temp_min) / (temp_max - temp_min)) - 1
-
-# Achatar (flatten) cada matriz (De 480x640 para 307200) para entrar na LSTM
+# Normalização Térmica para [-1, 1]
+data_tensor = 2 * ((data_tensor - temp_min_orig) / (temp_max_orig - temp_min_orig)) - 1
 data_tensor = data_tensor.view(data_tensor.size(0), -1)
+
 
 # --- ETAPA 2: CRIAÇÃO DE SEQUÊNCIAS ---
 def create_sequences(input_data, seq_length):
@@ -73,6 +69,7 @@ def create_sequences(input_data, seq_length):
         inout_seq.append((train_seq, train_label))
     return inout_seq
 
+
 sequences = create_sequences(data_tensor, SEQ_LENGTH)
 print(f"Sequências criadas: {len(sequences)}")
 
@@ -80,13 +77,14 @@ if len(sequences) == 0:
     print("Erro: Matrizes insuficientes para criar sequência.")
     exit()
 
-test_size = 1  # Apenas 1 para teste visual
+test_size = 1
 train_size = len(sequences) - test_size
 
 train_data = sequences[:train_size]
 test_data = sequences[train_size:]
 
 train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=False)
+
 
 # --- ETAPA 3: MODELO LSTM ---
 class ImageLSTM(nn.Module):
@@ -101,14 +99,14 @@ class ImageLSTM(nn.Module):
         predictions = self.linear(last_time_step_out)
         return predictions
 
-print(f"Tamanho do vetor de entrada: {FLAT_SIZE}")
+
 model = ImageLSTM(input_size=FLAT_SIZE, output_size=FLAT_SIZE).to(device)
 loss_function = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
 # --- ETAPA 4: TREINAMENTO ---
 print("\n--- Iniciando Treinamento ---")
-epochs = 5
+epochs = 15
 
 model.train()
 for i in range(epochs):
@@ -127,8 +125,8 @@ for i in range(epochs):
     if i % 5 == 0 or i == epochs - 1:
         print(f'Época {i} Loss: {epoch_loss / len(train_loader):.6f}')
 
-# --- ETAPA 5: SALVAR RESULTADO ---
-print("\n--- Gerando e Salvando Imagem ---")
+# --- ETAPA 5: AVALIAÇÃO E MEDIÇÃO DE ERRO ---
+print("\n--- Gerando Previsão e Medindo Erros ---")
 model.eval()
 
 with torch.no_grad():
@@ -138,35 +136,63 @@ with torch.no_grad():
 
         prediction = model(seq_test_tensor)
 
-        # Processamento para visualização (Adaptado para 1 canal)
-        def process_image_for_plot(tensor_flat):
-            # Volta para 2D (480, 640)
-            img = tensor_flat.cpu().view(IMG_HEIGHT, IMG_WIDTH).numpy()
-            # Desnormaliza de [-1, 1] para [0, 1] apenas para plotagem
-            img = (img + 1) / 2
-            return np.clip(img, 0, 1)
 
-        img_predicted = process_image_for_plot(prediction)
-        img_real = process_image_for_plot(label_real)
+        # Função para desnormalizar e voltar para 2D
+        def denormalize_and_reshape(tensor_flat, t_min, t_max):
+            img_norm = tensor_flat.cpu().view(IMG_HEIGHT, IMG_WIDTH).numpy()
+            img_real = ((img_norm + 1) / 2) * (t_max - t_min) + t_min
+            return img_real
 
-        # Plotagem e Salvamento com mapa de cores térmico (inferno)
-        plt.figure(figsize=(12, 5))
 
-        plt.subplot(1, 2, 1)
+        # Matrizes na escala real de temperatura
+        matriz_prevista = denormalize_and_reshape(prediction, temp_min_orig, temp_max_orig)
+        matriz_real = denormalize_and_reshape(label_real, temp_min_orig, temp_max_orig)
+
+        # --- CÁLCULO DE MÉTRICAS DE ERRO ---
+        # Erro Absoluto em cada pixel
+        mapa_erro = np.abs(matriz_real - matriz_prevista)
+
+        # Erro Médio Absoluto (MAE): Quantos graus erramos em média?
+        mae = np.mean(mapa_erro)
+
+        # Raiz do Erro Quadrático Médio (RMSE): Penaliza erros maiores
+        rmse = np.sqrt(np.mean((matriz_real - matriz_prevista) ** 2))
+
+        # Erro Máximo: Qual foi o maior desvio de temperatura num único pixel?
+        erro_max = np.max(mapa_erro)
+
+        print("-" * 30)
+        print("MÉTRICAS DE ERRO (Na escala de temperatura original):")
+        print(f"MAE (Erro Médio Absoluto): {mae:.2f} graus")
+        print(f"RMSE (Erro Quadrático Médio): {rmse:.2f} graus")
+        print(f"Erro Máximo num único pixel: {erro_max:.2f} graus")
+        print("-" * 30)
+
+        # Plotagem (Agora com 3 painéis)
+        plt.figure(figsize=(18, 5))  # Alargámos a figura para caberem 3 imagens
+
+        plt.subplot(1, 3, 1)
         plt.title("Real (Ground Truth)")
-        plt.imshow(img_real, cmap='inferno')
-        plt.colorbar(label='Temp Normalizada')
+        plt.imshow(matriz_real, cmap='turbo')
+        plt.colorbar(label='Temperatura')
         plt.axis('off')
 
-        plt.subplot(1, 2, 2)
-        plt.title("Previsão LSTM")
-        plt.imshow(img_predicted, cmap='inferno')
-        plt.colorbar(label='Temp Normalizada')
+        plt.subplot(1, 3, 2)
+        plt.title(f"Previsão (MAE: {mae:.2f})")
+        plt.imshow(matriz_prevista, cmap='turbo')
+        plt.colorbar(label='Temperatura')
         plt.axis('off')
 
-        nome_arquivo = 'resultado_previsao_h5.png'
-        plt.savefig(nome_arquivo)
-        print(f"SUCESSO! A imagem foi salva como '{nome_arquivo}' na pasta do projeto.")
+        plt.subplot(1, 3, 3)
+        plt.title(f"Mapa de Erro (Máx: {erro_max:.2f})")
+        # Usamos o mapa 'hot' ou 'Reds' para destacar onde o erro é maior
+        plt.imshow(mapa_erro, cmap='Reds')
+        plt.colorbar(label='Erro Absoluto (Graus)')
+        plt.axis('off')
+
+        nome_arquivo = 'resultado_previsao_com_erros.png'
+        plt.savefig(nome_arquivo, bbox_inches='tight')
+        print(f"\nSUCESSO! A imagem de análise foi salva como '{nome_arquivo}'.")
 
         plt.close()
     else:
