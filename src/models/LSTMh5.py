@@ -18,7 +18,7 @@ start_time = time.time()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Dispositivo: {device}")
 
-ARQUIVO_H5 = 'dataset_axia_completo_2d.h5'
+ARQUIVO_H5 = 'data/processed/dataset_axia_completo_2d.h5'
 
 # Dimensões exatas das matrizes salvas no HDF5
 IMG_HEIGHT = 480
@@ -190,8 +190,9 @@ with torch.no_grad():
         plt.colorbar(label='Erro Absoluto (Graus)')
         plt.axis('off')
 
-        nome_arquivo = 'resultado_previsao_com_erros.png'
-        plt.savefig(nome_arquivo, bbox_inches='tight')
+        os.makedirs('results/figures', exist_ok=True)  # Garante que a pasta existe
+        nome_arquivo = 'results/figures/resultado_previsao_h5.png'
+        plt.savefig(nome_arquivo)
         print(f"\nSUCESSO! A imagem de análise foi salva como '{nome_arquivo}'.")
 
         plt.close()

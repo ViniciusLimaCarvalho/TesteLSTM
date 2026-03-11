@@ -16,7 +16,7 @@ device = torch.device("cuda")
 print(f"Dispositivo selecionado: {device}")
 
 try:
-    df = pd.read_csv('input/measures_v2.csv')
+    df = pd.read_csv('data/raw/input/measures_v2.csv')
     print(f"Arquivo CSV carregado com sucesso.")
     print(f"Formato do DataFrame (linhas, colunas): {df.shape}")
 except FileNotFoundError:
