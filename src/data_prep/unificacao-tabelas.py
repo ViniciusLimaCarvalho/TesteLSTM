@@ -5,9 +5,12 @@ import numpy as np
 import h5py
 
 # --- CONFIGURAÇÕES ---
-ARQUIVO_EXCEL = "AD-TF2Y.xlsx"
-PASTA_MATRIZES = "V3.A1_CSV"
-ARQUIVO_SAIDA = "dataset_axia_completo_2d.h5"  # Novo nome para o ficheiro
+ARQUIVO_EXCEL = "data/raw/AD-TF2Y.xlsx"
+PASTA_MATRIZES = "data/raw/V3.A1_CSV"
+
+# Garante que a pasta processed exista antes de criar o arquivo
+os.makedirs('data/processed', exist_ok=True)
+ARQUIVO_SAIDA = "data/processed/dataset_axia_completo_2d.h5"
 
 print("A ler dados do Excel...")
 abas_excel = pd.read_excel(ARQUIVO_EXCEL, sheet_name=None)

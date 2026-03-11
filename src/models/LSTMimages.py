@@ -18,7 +18,7 @@ start_time = time.time()
 # --- CONFIGURAÇÕES ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Dispositivo: {device}")
-pasta = 'V3.A1'
+pasta = 'data/raw/V3.A1'
 
 IMG_HEIGHT = 400
 IMG_WIDTH = 400
@@ -176,7 +176,8 @@ with torch.no_grad():
         plt.imshow(img_predicted)
         plt.axis('off')
 
-        nome_arquivo = 'resultado_previsao.png'
+        os.makedirs('results/figures', exist_ok=True)
+        nome_arquivo = 'results/figures/resultado_previsao.png'
         plt.savefig(nome_arquivo)
         print(f"SUCESSO! A imagem foi salva como '{nome_arquivo}' na pasta do projeto.")
 
