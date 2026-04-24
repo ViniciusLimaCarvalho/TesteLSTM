@@ -1,0 +1,9 @@
+services:
+  lstm-api:
+    build: .
+    ports:
+      - "8080:8000"
+    volumes:
+      - ./data:/app/data
+      - ./results:/app/results
+    restart: unless-stopped
