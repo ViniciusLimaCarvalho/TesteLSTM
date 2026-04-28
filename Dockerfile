@@ -8,7 +8,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY src/api/ ./src/api/
 COPY data/ ./data/
 
-RUN mkdir -p results/figures
+RUN mkdir -p results/figures results/predictions
 
 EXPOSE 8000
 

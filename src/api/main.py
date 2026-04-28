@@ -7,258 +7,140 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
 from typing import Optional
 
-from lstm_core import LSTMCSVModel, LSTMThermalModel, LSTMImagesModel
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 
-# Raiz do projeto (TesteLSTM/)
+from lstm_core import LSTMCSVFolderModel
+
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+MODEL_PATH = os.path.join(PROJECT_ROOT, "results", "models", "lstm_csv_folder.pt")
 
 app = FastAPI(
-    title="LSTM Temperature Prediction API",
+    title="LSTM Thermal CSV Folder API",
     description=(
-        "API local para predição de temperatura em motor elétrico usando modelos LSTM.\n\n"
-        "**Modelos disponíveis:**\n"
-        "- `/csv` — LSTM com dados tabulares de sensores (CSV)\n"
-        "- `/h5` — LSTM com matrizes térmicas 480×640 + sensores (HDF5)\n"
-        "- `/images` — LSTM com sequências de imagens RGB\n\n"
-        "**Fluxo:** chame `/train` para treinar, depois `/predict` para gerar previsões."
+        "API para treinar e prever matrizes térmicas a partir de uma pasta de CSVs.\n\n"
+        "Cada CSV na pasta representa uma matriz térmica (um frame). O LSTM aprende a "
+        "sequência temporal e prevê o próximo frame.\n\n"
+        "**Endpoints:** `POST /train`, `POST /predict` e `POST /predict_stacked`."
     ),
     version="1.0.0",
 )
 
-# Instâncias dos modelos mantidas em memória durante a sessão do servidor
-_models: dict = {
-    "csv": LSTMCSVModel(),
-    "thermal": LSTMThermalModel(),
-    "images": LSTMImagesModel(),
-}
+_model = LSTMCSVFolderModel()
+if os.path.exists(MODEL_PATH):
+    try:
+        _model.load(MODEL_PATH)
+        print(f"[startup] Modelo carregado de {MODEL_PATH}")
+    except Exception as e:
+        print(f"[startup] Falha ao carregar {MODEL_PATH}: {e}")
 
 
-# ─── Schemas ──────────────────────────────────────────────────────────────────
-
-class CSVTrainRequest(BaseModel):
-    csv_path: str = Field(
-        default="data/raw/input/measures_v2.csv",
-        description="Caminho para o CSV (relativo à raiz do projeto ou absoluto)",
-    )
-    target_column: str = Field(default="stator_winding", description="Coluna alvo")
-    seq_length: int = Field(default=10, ge=1, description="Comprimento da sequência temporal")
-    hidden_size: int = Field(default=100, ge=1, description="Tamanho da camada oculta LSTM")
-    epochs: int = Field(default=10, ge=1, description="Número de épocas de treino")
-    lr: float = Field(default=0.001, gt=0, description="Taxa de aprendizado")
-    batch_size: int = Field(default=64, ge=1, description="Tamanho do batch")
-
-
-class CSVPredictRequest(BaseModel):
-    csv_path: str = Field(default="data/raw/input/measures_v2.csv")
-    target_column: str = Field(default="stator_winding")
-    save_plot: bool = Field(default=True, description="Salvar gráfico em results/figures/")
-
-
-class H5TrainRequest(BaseModel):
-    h5_path: str = Field(
-        default="data/processed/dataset_axia_completo_2d.h5",
-        description="Caminho para o arquivo HDF5",
-    )
-    seq_length: int = Field(default=3, ge=1)
-    hidden_size: int = Field(default=128, ge=1)
-    epochs: int = Field(default=1, ge=1)
-    lr: float = Field(default=0.001, gt=0)
-    batch_size: int = Field(default=4, ge=1)
-
-
-class H5PredictRequest(BaseModel):
-    h5_path: str = Field(default="data/processed/dataset_axia_completo_2d.h5")
-    save_plot: bool = Field(default=True)
-
-
-class ImagesTrainRequest(BaseModel):
-    images_folder: str = Field(
-        default="data/raw/V3.A1",
-        description="Pasta com as imagens (.jpg/.png)",
+class TrainRequest(BaseModel):
+    folder: str = Field(
+        default="data/raw/V3.A1_CSV",
+        description="Pasta com os CSVs (relativa à raiz do projeto ou absoluta).",
     )
     seq_length: int = Field(default=3, ge=1)
     hidden_size: int = Field(default=128, ge=1)
     epochs: int = Field(default=5, ge=1)
     lr: float = Field(default=0.001, gt=0)
     batch_size: int = Field(default=4, ge=1)
-    img_height: int = Field(default=400, ge=1, description="Altura para redimensionar imagens")
-    img_width: int = Field(default=400, ge=1, description="Largura para redimensionar imagens")
 
 
-class ImagesPredictRequest(BaseModel):
-    images_folder: str = Field(default="data/raw/V3.A1")
-    save_plot: bool = Field(default=True)
+class PredictRequest(BaseModel):
+    folder: str = Field(default="data/raw/V3.A1_CSV")
+    save_outputs: bool = Field(
+        default=True,
+        description="Salvar CSV previsto em results/predictions/ e figura JPG em results/figures/.",
+    )
+    target_timestamp: Optional[str] = Field(
+        default=None,
+        description=(
+            "Timestamp do frame a prever (ex.: '2026-01-08T02:00' ou '2026-01-08 02:00'). "
+            "Precisa existir entre os arquivos e ter pelo menos seq_length frames anteriores. "
+            "Padrão: prevê o último frame da pasta."
+        ),
+    )
 
-
-# ─── Utilitário ───────────────────────────────────────────────────────────────
 
 def _resolve(path: str) -> str:
-    """Resolve caminhos relativos à raiz do projeto."""
     return path if os.path.isabs(path) else os.path.join(PROJECT_ROOT, path)
 
 
-# ─── Rotas gerais ─────────────────────────────────────────────────────────────
-
-@app.get("/", tags=["Info"])
-def root():
-    return {
-        "name": "LSTM Temperature Prediction API",
-        "version": "1.0.0",
-        "docs": "/docs",
-        "endpoints": {
-            "csv": {"train": "POST /csv/train", "predict": "POST /csv/predict"},
-            "thermal_h5": {"train": "POST /h5/train", "predict": "POST /h5/predict"},
-            "images": {"train": "POST /images/train", "predict": "POST /images/predict"},
-        },
-    }
-
-
-@app.get("/status", tags=["Info"])
-def status():
-    """Retorna quais modelos já foram treinados nesta sessão."""
-    return {
-        "csv_trained": _models["csv"].model is not None,
-        "thermal_trained": _models["thermal"].model is not None,
-        "images_trained": _models["images"].model is not None,
-    }
-
-
-# ─── CSV ──────────────────────────────────────────────────────────────────────
-
-@app.post("/csv/train", tags=["CSV - Sensores Tabulares"])
-def csv_train(req: CSVTrainRequest):
-    """Treina o modelo LSTM com dados tabulares de sensores (arquivo CSV)."""
-    path = _resolve(req.csv_path)
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail=f"CSV não encontrado: {path}")
-
-    _models["csv"] = LSTMCSVModel(
-        seq_length=req.seq_length,
-        hidden_size=req.hidden_size,
-        epochs=req.epochs,
-        lr=req.lr,
-        batch_size=req.batch_size,
-    )
-    try:
-        result = _models["csv"].train(path, target_column=req.target_column)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    return result
-
-
-@app.post("/csv/predict", tags=["CSV - Sensores Tabulares"])
-def csv_predict(req: CSVPredictRequest):
-    """Gera previsões com o modelo CSV treinado. Retorna métricas e gráfico em base64."""
-    if _models["csv"].model is None:
-        raise HTTPException(status_code=400, detail="Modelo CSV não treinado. Chame POST /csv/train primeiro.")
-
-    path = _resolve(req.csv_path)
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail=f"CSV não encontrado: {path}")
-
-    save_path = os.path.join(PROJECT_ROOT, "results", "figures", "resultado_previsao_csv.png") if req.save_plot else None
-    try:
-        result = _models["csv"].predict(path, target_column=req.target_column, save_path=save_path)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    if save_path:
-        result["saved_to"] = save_path
-    return result
-
-
-# ─── H5 Matrizes Térmicas ─────────────────────────────────────────────────────
-
-@app.post("/h5/train", tags=["H5 - Matrizes Térmicas"])
-def h5_train(req: H5TrainRequest):
-    """Treina o modelo LSTM com matrizes térmicas 480×640 + 18 sensores (arquivo HDF5)."""
-    path = _resolve(req.h5_path)
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail=f"Arquivo H5 não encontrado: {path}")
-
-    _models["thermal"] = LSTMThermalModel(
-        seq_length=req.seq_length,
-        hidden_size=req.hidden_size,
-        epochs=req.epochs,
-        lr=req.lr,
-        batch_size=req.batch_size,
-    )
-    try:
-        result = _models["thermal"].train(path)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    return result
-
-
-@app.post("/h5/predict", tags=["H5 - Matrizes Térmicas"])
-def h5_predict(req: H5PredictRequest):
-    """Gera previsão da próxima matriz térmica. Retorna MAE, RMSE e gráfico comparativo em base64."""
-    if _models["thermal"].model is None:
-        raise HTTPException(status_code=400, detail="Modelo H5 não treinado. Chame POST /h5/train primeiro.")
-
-    path = _resolve(req.h5_path)
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail=f"Arquivo H5 não encontrado: {path}")
-
-    save_path = os.path.join(PROJECT_ROOT, "results", "figures", "resultado_previsao_h5.png") if req.save_plot else None
-    try:
-        result = _models["thermal"].predict(path, save_path=save_path)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    if save_path:
-        result["saved_to"] = save_path
-    return result
-
-
-# ─── Imagens RGB ──────────────────────────────────────────────────────────────
-
-@app.post("/images/train", tags=["Images - Sequências RGB"])
-def images_train(req: ImagesTrainRequest):
-    """Treina o modelo LSTM com sequências de imagens RGB de uma pasta."""
-    folder = _resolve(req.images_folder)
-    if not os.path.exists(folder):
+@app.post("/train")
+def train(req: TrainRequest):
+    """Treina o LSTM com os CSVs da pasta informada."""
+    global _model
+    folder = _resolve(req.folder)
+    if not os.path.isdir(folder):
         raise HTTPException(status_code=404, detail=f"Pasta não encontrada: {folder}")
 
-    _models["images"] = LSTMImagesModel(
+    _model = LSTMCSVFolderModel(
         seq_length=req.seq_length,
         hidden_size=req.hidden_size,
         epochs=req.epochs,
         lr=req.lr,
         batch_size=req.batch_size,
-        img_height=req.img_height,
-        img_width=req.img_width,
     )
     try:
-        result = _models["images"].train(folder)
+        result = _model.train(folder)
+        _model.save(MODEL_PATH)
+        result["model_saved_to"] = MODEL_PATH
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    return result
 
 
-@app.post("/images/predict", tags=["Images - Sequências RGB"])
-def images_predict(req: ImagesPredictRequest):
-    """Gera previsão do próximo frame da sequência de imagens. Retorna gráfico comparativo em base64."""
-    if _models["images"].model is None:
-        raise HTTPException(status_code=400, detail="Modelo de imagens não treinado. Chame POST /images/train primeiro.")
+@app.post("/predict")
+def predict(req: PredictRequest):
+    """Gera a próxima matriz prevista. Salva CSV e JPG (heatmap turbo) em results/."""
+    if _model.model is None:
+        raise HTTPException(status_code=400, detail="Modelo não treinado. Chame POST /train primeiro.")
 
-    folder = _resolve(req.images_folder)
-    if not os.path.exists(folder):
+    folder = _resolve(req.folder)
+    if not os.path.isdir(folder):
         raise HTTPException(status_code=404, detail=f"Pasta não encontrada: {folder}")
 
-    save_path = os.path.join(PROJECT_ROOT, "results", "figures", "resultado_previsao_images.png") if req.save_plot else None
+    csv_path = jpg_path = None
+    if req.save_outputs:
+        csv_path = os.path.join(PROJECT_ROOT, "results", "predictions", "previsao_csv_folder.csv")
+        jpg_path = os.path.join(PROJECT_ROOT, "results", "figures", "previsao_csv_folder.jpg")
+
     try:
-        result = _models["images"].predict(folder, save_path=save_path)
+        return _model.predict(
+            folder,
+            target_timestamp=req.target_timestamp,
+            save_csv_path=csv_path,
+            save_jpg_path=jpg_path,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    if save_path:
-        result["saved_to"] = save_path
-    return result
+
+@app.post("/predict_stacked")
+def predict_stacked(req: PredictRequest):
+    """Gera previsões para todas as sequências e empilha verticalmente em um único CSV.
+    Salva o CSV empilhado e um JPG com grid de heatmaps turbo dos frames previstos."""
+    if _model.model is None:
+        raise HTTPException(status_code=400, detail="Modelo não treinado. Chame POST /train primeiro.")
+
+    folder = _resolve(req.folder)
+    if not os.path.isdir(folder):
+        raise HTTPException(status_code=404, detail=f"Pasta não encontrada: {folder}")
+
+    csv_path = jpg_path = None
+    if req.save_outputs:
+        csv_path = os.path.join(PROJECT_ROOT, "results", "predictions", "previsao_csv_folder_stacked.csv")
+        jpg_path = os.path.join(PROJECT_ROOT, "results", "figures", "previsao_csv_folder_stacked.jpg")
+
+    try:
+        return _model.predict_stacked(folder, save_csv_path=csv_path, save_jpg_path=jpg_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
