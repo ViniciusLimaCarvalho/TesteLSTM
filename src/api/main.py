@@ -59,8 +59,10 @@ class PredictRequest(BaseModel):
         default=None,
         description=(
             "Timestamp do frame a prever (ex.: '2026-01-08T02:00' ou '2026-01-08 02:00'). "
-            "Precisa existir entre os arquivos e ter pelo menos seq_length frames anteriores. "
-            "Padrão: prevê o último frame da pasta."
+            "Se existir entre os arquivos, compara com o frame real e devolve MAE/RMSE. "
+            "Se não existir, usa predição auto-regressiva a partir do último frame anterior "
+            "ao timestamp (sem MAE, prediction sintética). "
+            "Padrão: prevê o próximo frame após o último da pasta."
         ),
     )
 
@@ -132,13 +134,21 @@ def predict_stacked(req: PredictRequest):
     if not os.path.isdir(folder):
         raise HTTPException(status_code=404, detail=f"Pasta não encontrada: {folder}")
 
-    csv_path = jpg_path = None
+    csv_path = jpg_path = error_jpg_path = temp_jpg_path = None
     if req.save_outputs:
         csv_path = os.path.join(PROJECT_ROOT, "results", "predictions", "previsao_csv_folder_stacked.csv")
         jpg_path = os.path.join(PROJECT_ROOT, "results", "figures", "previsao_csv_folder_stacked.jpg")
+        error_jpg_path = os.path.join(PROJECT_ROOT, "results", "figures", "erro_csv_folder_stacked.jpg")
+        temp_jpg_path = os.path.join(PROJECT_ROOT, "results", "figures", "temperatura_csv_folder_stacked.jpg")
 
     try:
-        return _model.predict_stacked(folder, save_csv_path=csv_path, save_jpg_path=jpg_path)
+        return _model.predict_stacked(
+            folder,
+            save_csv_path=csv_path,
+            save_jpg_path=jpg_path,
+            save_error_jpg_path=error_jpg_path,
+            save_temp_jpg_path=temp_jpg_path,
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -6,7 +6,7 @@ API REST que treina um LSTM sobre uma pasta de CSVs (cada CSV = uma matriz térm
 
 - `POST /train` — treina o modelo com os CSVs da pasta. Salva os pesos em `results/models/lstm_csv_folder.pt`.
 - `POST /predict` — prevê um frame. Salva CSV (`results/predictions/`) e heatmap turbo JPG (`results/figures/`).
-- `POST /predict_stacked` — prevê todas as sequências possíveis e empilha os frames previstos verticalmente em um único CSV + grid de heatmaps JPG.
+- `POST /predict_stacked` — prevê todas as sequências possíveis e empilha os frames previstos verticalmente em um único CSV + grid de heatmaps JPG. Também salva um gráfico de erro (MAE) por amostra de tempo em `results/figures/erro_csv_folder_stacked.jpg`.
 
 ## Persistência
 
@@ -28,12 +28,26 @@ No `POST /predict`, o campo opcional `target_timestamp` permite escolher qual fr
 
 Aceita formato ISO (`2026-01-08T02:00`) ou com espaço (`2026-01-08 02:00`).
 
-**Restrições**:
-- O timestamp **precisa existir** entre os arquivos da pasta (predição auto-regressiva de timestamps futuros não é suportada nesta versão).
-- Precisa haver pelo menos `seq_length` frames anteriores ao timestamp escolhido.
+**Comportamento**:
+- Se o timestamp **existe** entre os arquivos, a predição é comparada com o frame real e o resultado inclui `mae`, `rmse` e `max_pixel_error`.
+- Se o timestamp **não existe**, a predição é sintética: o modelo é iterado de forma auto-regressiva a partir do último frame disponível antes do alvo. O número de iterações é estimado pelo intervalo mediano entre frames da pasta. O resultado vem com `synthetic: true` e `autoregressive_steps: N`, sem métricas de erro (não há frame real para comparar).
+- Precisa haver pelo menos `seq_length` frames anteriores ao timestamp escolhido (ou ao âncora, no caso sintético).
 - Sem `target_timestamp`, o último frame da pasta é usado.
 
 Erros de validação retornam HTTP 400 com mensagem descritiva.
+
+## Erro por amostra (predict_stacked)
+
+`POST /predict_stacked` agora salva também um gráfico `results/figures/erro_csv_folder_stacked.jpg` com o MAE de cada frame previsto vs o real, com timestamps no eixo X. Útil pra ver em quais momentos o modelo erra mais. O JSON da resposta inclui o array `mae_per_frame` com os valores numéricos.
+
+## Temperatura real vs prevista (predict_stacked)
+
+Também é gerado `results/figures/temperatura_csv_folder_stacked.jpg`, com a temperatura média de cada frame ao longo do tempo:
+
+- Pontos verdes — frames reais.
+- Linha vermelha — frames previstos. Entre cada par de previsões reais, são inseridas **3 predições sintéticas** geradas auto-regressivamente (a saída do modelo é realimentada como entrada). O resultado é uma curva mais densa e visualmente contínua.
+
+O número de sintéticas entre cada par é configurável via parâmetro `n_synthetic_between` na chamada interna (default 3).
 
 ## Executando
 

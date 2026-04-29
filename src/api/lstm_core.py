@@ -204,57 +204,103 @@ class LSTMCSVFolderModel:
         data = self._load_folder(folder)
         flat = self._normalize(data)
 
+        target_ts = None
+        is_synthetic = False
+        n_steps = 1
+        seq_test = None
+        label_real = None
+
         if target_timestamp is not None:
             if isinstance(target_timestamp, str):
                 target_ts = datetime.fromisoformat(target_timestamp.replace(' ', 'T'))
             else:
                 target_ts = target_timestamp
             target_ts = target_ts.replace(second=0, microsecond=0)
-            try:
-                idx = next(i for i, ts in enumerate(self.timestamps) if ts == target_ts)
-            except StopIteration:
-                raise ValueError(
-                    f"Timestamp {target_ts.isoformat()} não encontrado nos arquivos da pasta."
+
+            exact_idx = next(
+                (i for i, ts in enumerate(self.timestamps) if ts == target_ts), None
+            )
+            if exact_idx is not None:
+                if exact_idx < self.seq_length:
+                    raise ValueError(
+                        f"Timestamp em índice {exact_idx} requer {self.seq_length} frames anteriores; "
+                        f"apenas {exact_idx} disponíveis."
+                    )
+                seq_test = flat[exact_idx - self.seq_length:exact_idx]
+                label_real = flat[exact_idx:exact_idx + 1]
+            else:
+                valid = sorted(
+                    [(i, ts) for i, ts in enumerate(self.timestamps) if ts is not None],
+                    key=lambda p: p[1],
                 )
-            if idx < self.seq_length:
-                raise ValueError(
-                    f"Timestamp em índice {idx} requer {self.seq_length} frames anteriores; "
-                    f"apenas {idx} disponíveis."
-                )
-            seq_test = flat[idx - self.seq_length:idx]
-            label_real = flat[idx:idx + 1]
+                before = [p for p in valid if p[1] < target_ts]
+                if not before:
+                    raise ValueError(
+                        f"Timestamp {target_ts.isoformat()} é anterior a todos os frames "
+                        f"disponíveis na pasta."
+                    )
+                anchor_idx, anchor_ts = before[-1]
+                if anchor_idx + 1 < self.seq_length:
+                    raise ValueError(
+                        f"Frame âncora em índice {anchor_idx} requer {self.seq_length} frames; "
+                        f"apenas {anchor_idx + 1} disponíveis."
+                    )
+                sorted_ts = [t for _, t in valid]
+                deltas = [
+                    (sorted_ts[i + 1] - sorted_ts[i]).total_seconds()
+                    for i in range(len(sorted_ts) - 1)
+                ]
+                if not deltas:
+                    raise ValueError("Não há intervalos suficientes para inferir o passo temporal.")
+                median_step = sorted(deltas)[len(deltas) // 2]
+                target_delta = (target_ts - anchor_ts).total_seconds()
+                n_steps = max(1, round(target_delta / median_step))
+                seq_test = flat[anchor_idx - self.seq_length + 1:anchor_idx + 1]
+                is_synthetic = True
         else:
             seqs = self._make_sequences(flat)
             if not seqs:
                 raise ValueError("Frames insuficientes para previsão.")
             seq_test, label_real = seqs[-1]
-            idx = len(self.timestamps) - 1
+            target_ts = self.timestamps[-1] if self.timestamps else None
 
         self.model.eval()
         with torch.no_grad():
-            pred = self.model(seq_test.unsqueeze(0).to(self.device))
+            if is_synthetic and n_steps > 1:
+                seq_window = seq_test.clone()
+                for _ in range(n_steps):
+                    pred = self.model(seq_window.unsqueeze(0).to(self.device))
+                    pred_cpu = pred.detach().cpu().squeeze(0)
+                    seq_window = torch.cat([seq_window[1:], pred_cpu.unsqueeze(0)], dim=0)
+            else:
+                pred = self.model(seq_test.unsqueeze(0).to(self.device))
 
         def denorm(t_flat):
             img = t_flat.detach().cpu().reshape(self.height, self.width).numpy()
             return ((img + 1) / 2) * (self.temp_max - self.temp_min) + self.temp_min
 
         mat_pred = denorm(pred)
-        mat_real = denorm(label_real)
-        error_map = np.abs(mat_real - mat_pred)
-        mae = float(np.mean(error_map))
-        rmse = float(np.sqrt(np.mean((mat_real - mat_pred) ** 2)))
-        max_err = float(np.max(error_map))
-
-        target_ts = self.timestamps[idx] if 0 <= idx < len(self.timestamps) else None
         ts_str = target_ts.strftime('%Y-%m-%d %H:%M') if target_ts else 'N/A'
 
         result = {
-            "mae": round(mae, 4),
-            "rmse": round(rmse, 4),
-            "max_pixel_error": round(max_err, 4),
+            "synthetic": is_synthetic,
+            "autoregressive_steps": n_steps,
             "frame_shape": [self.height, self.width],
             "target_timestamp": target_ts.isoformat() if target_ts else None,
         }
+
+        if label_real is not None:
+            mat_real = denorm(label_real)
+            error_map = np.abs(mat_real - mat_pred)
+            mae = float(np.mean(error_map))
+            rmse = float(np.sqrt(np.mean((mat_real - mat_pred) ** 2)))
+            max_err = float(np.max(error_map))
+            result["mae"] = round(mae, 4)
+            result["rmse"] = round(rmse, 4)
+            result["max_pixel_error"] = round(max_err, 4)
+            title_metric = f" (MAE: {mae:.2f})"
+        else:
+            title_metric = f" (sintético, {n_steps} passo{'s' if n_steps > 1 else ''})"
 
         if save_csv_path:
             os.makedirs(os.path.dirname(save_csv_path), exist_ok=True)
@@ -263,7 +309,7 @@ class LSTMCSVFolderModel:
 
         fig, ax = plt.subplots(figsize=(8, 6))
         im = ax.imshow(mat_pred, cmap='turbo')
-        ax.set_title(f"Previsão LSTM — {ts_str} (MAE: {mae:.2f})")
+        ax.set_title(f"Previsão LSTM — {ts_str}{title_metric}")
         ax.axis('off')
         plt.colorbar(im, ax=ax, label='Temperatura')
 
@@ -280,6 +326,9 @@ class LSTMCSVFolderModel:
         folder: str,
         save_csv_path: str = None,
         save_jpg_path: str = None,
+        save_error_jpg_path: str = None,
+        save_temp_jpg_path: str = None,
+        n_synthetic_between: int = 3,
     ) -> dict:
         if self.model is None:
             raise RuntimeError("Modelo não treinado. Execute /train primeiro.")
@@ -306,6 +355,7 @@ class LSTMCSVFolderModel:
         mae = float(np.mean(error))
         rmse = float(np.sqrt(np.mean((actuals_d - preds_d) ** 2)))
         max_err = float(np.max(error))
+        mae_per_frame = error.mean(axis=(1, 2))
 
         result = {
             "n_predictions": int(preds_d.shape[0]),
@@ -313,6 +363,7 @@ class LSTMCSVFolderModel:
             "rmse": round(rmse, 4),
             "max_pixel_error": round(max_err, 4),
             "frame_shape": [self.height, self.width],
+            "mae_per_frame": [round(float(v), 4) for v in mae_per_frame],
         }
 
         if save_csv_path:
@@ -355,4 +406,106 @@ class LSTMCSVFolderModel:
             result["jpg_saved_to"] = save_jpg_path
 
         result["plot_base64"] = _fig_to_base64(fig, fmt='jpg')
+
+        fig_err, ax_err = plt.subplots(figsize=(12, 5))
+        x = np.arange(len(mae_per_frame))
+        ax_err.plot(x, mae_per_frame, marker='o', linewidth=1.5, color='#c0392b')
+        ax_err.fill_between(x, mae_per_frame, alpha=0.15, color='#c0392b')
+        if pred_timestamps and any(ts is not None for ts in pred_timestamps):
+            step = max(1, len(x) // 12)
+            ax_err.set_xticks(x[::step])
+            ax_err.set_xticklabels(
+                [pred_timestamps[i].strftime('%m-%d %H:%M') if pred_timestamps[i] else str(i)
+                 for i in range(0, len(pred_timestamps), step)],
+                rotation=45, ha='right',
+            )
+            ax_err.set_xlabel('Timestamp')
+        else:
+            ax_err.set_xlabel('Índice da amostra')
+        ax_err.set_ylabel('MAE (real vs previsto)')
+        ax_err.set_title(f'Erro médio absoluto por amostra — N={len(mae_per_frame)} | MAE global={mae:.2f}')
+        ax_err.grid(True, alpha=0.3)
+        fig_err.tight_layout()
+
+        if save_error_jpg_path:
+            os.makedirs(os.path.dirname(save_error_jpg_path), exist_ok=True)
+            fig_err.savefig(save_error_jpg_path, format='jpg', bbox_inches='tight')
+            result["error_jpg_saved_to"] = save_error_jpg_path
+
+        plt.close(fig_err)
+
+        interleaved_d = []
+        is_real_mask = []
+        with torch.no_grad():
+            for i, (seq_in, _) in enumerate(seqs):
+                interleaved_d.append(preds_d[i])
+                is_real_mask.append(True)
+                if i < len(seqs) - 1:
+                    seq_window = seq_in.clone()
+                    cur_pred_flat = torch.from_numpy(preds[i].reshape(-1))
+                    for _ in range(n_synthetic_between):
+                        seq_window = torch.cat(
+                            [seq_window[1:], cur_pred_flat.unsqueeze(0)], dim=0
+                        )
+                        new_pred = self.model(seq_window.unsqueeze(0).to(self.device))
+                        cur_pred_flat = new_pred.detach().cpu().squeeze(0)
+                        syn_norm = cur_pred_flat.reshape(self.height, self.width).numpy()
+                        interleaved_d.append(((syn_norm + 1) / 2) * scale + self.temp_min)
+                        is_real_mask.append(False)
+
+        interleaved_d = np.stack(interleaved_d, axis=0)
+        real_temps = actuals_d.mean(axis=(1, 2))
+        pred_temps = interleaved_d.mean(axis=(1, 2))
+
+        real_x = np.arange(len(seqs), dtype=float)
+        pred_x = np.empty(len(is_real_mask), dtype=float)
+        real_idx = 0
+        syn_count = 0
+        for k, is_real in enumerate(is_real_mask):
+            if is_real:
+                pred_x[k] = float(real_idx)
+                real_idx += 1
+                syn_count = 0
+            else:
+                syn_count += 1
+                pred_x[k] = real_idx - 1 + syn_count / (n_synthetic_between + 1)
+
+        fig_temp, ax_temp = plt.subplots(figsize=(12, 5))
+        ax_temp.plot(
+            pred_x, pred_temps, '-', linewidth=1.2, color='#c0392b',
+            label=f'Previsto (real + {n_synthetic_between} sintéticas entre cada par)',
+            alpha=0.85,
+        )
+        ax_temp.plot(
+            real_x, real_temps, 'o-', color='#27ae60',
+            label='Real', markersize=6, linewidth=1.2, zorder=5,
+        )
+        if pred_timestamps and any(ts is not None for ts in pred_timestamps):
+            step = max(1, len(real_x) // 12)
+            tick_idx = np.arange(0, len(pred_timestamps), step)
+            ax_temp.set_xticks(real_x[::step])
+            ax_temp.set_xticklabels(
+                [pred_timestamps[i].strftime('%m-%d %H:%M') if pred_timestamps[i] else str(i)
+                 for i in tick_idx],
+                rotation=45, ha='right',
+            )
+            ax_temp.set_xlabel('Timestamp')
+        else:
+            ax_temp.set_xlabel('Índice da amostra')
+        ax_temp.set_ylabel('Temperatura média do frame')
+        ax_temp.set_title(
+            f'Temperatura real vs prevista — N={len(seqs)} reais '
+            f'+ {n_synthetic_between} sintéticas entre pares'
+        )
+        ax_temp.legend(loc='best')
+        ax_temp.grid(True, alpha=0.3)
+        fig_temp.tight_layout()
+
+        if save_temp_jpg_path:
+            os.makedirs(os.path.dirname(save_temp_jpg_path), exist_ok=True)
+            fig_temp.savefig(save_temp_jpg_path, format='jpg', bbox_inches='tight')
+            result["temp_jpg_saved_to"] = save_temp_jpg_path
+
+        plt.close(fig_temp)
+        result["n_synthetic_between"] = n_synthetic_between
         return result
