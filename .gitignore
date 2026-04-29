@@ -4,3 +4,7 @@ __pycache__/
 .idea/
 *.egg-info/
 results/predictions
+*.pt
+results/models/
+results/models/lstm_csv_folder.pt
+results/models/lstm_csv_folder.pt
