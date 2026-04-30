@@ -45,15 +45,51 @@ def _fig_to_base64(fig, fmt: str = 'jpg') -> str:
     return encoded
 
 
-class _ThermalNet(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, output_size: int):
+class _ConvLSTMCell(nn.Module):
+    def __init__(self, input_channels: int, hidden_channels: int, kernel_size: int = 3):
         super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
-        self.linear = nn.Linear(hidden_size, output_size)
+        self.hidden_channels = hidden_channels
+        padding = kernel_size // 2
+        self.conv = nn.Conv2d(
+            input_channels + hidden_channels,
+            4 * hidden_channels,
+            kernel_size,
+            padding=padding,
+        )
+
+    def forward(self, x, h, c):
+        gates = self.conv(torch.cat([x, h], dim=1))
+        i, f, o, g = torch.split(gates, self.hidden_channels, dim=1)
+        i = torch.sigmoid(i)
+        f = torch.sigmoid(f)
+        o = torch.sigmoid(o)
+        g = torch.tanh(g)
+        c = f * c + i * g
+        h = o * torch.tanh(c)
+        return h, c
+
+
+class _ThermalNet(nn.Module):
+    """ConvLSTM mantendo o contrato (batch, seq, H*W) -> (batch, H*W)."""
+
+    def __init__(self, height: int, width: int, hidden_channels: int, kernel_size: int = 3):
+        super().__init__()
+        self.height = height
+        self.width = width
+        self.hidden_channels = hidden_channels
+        self.cell = _ConvLSTMCell(1, hidden_channels, kernel_size)
+        self.out_conv = nn.Conv2d(
+            hidden_channels, 1, kernel_size, padding=kernel_size // 2
+        )
 
     def forward(self, x):
-        out, _ = self.lstm(x)
-        return self.linear(out[:, -1, :])
+        b, s, _ = x.shape
+        x = x.reshape(b, s, 1, self.height, self.width)
+        h = torch.zeros(b, self.hidden_channels, self.height, self.width, device=x.device)
+        c = torch.zeros_like(h)
+        for t in range(s):
+            h, c = self.cell(x[:, t], h, c)
+        return self.out_conv(h).reshape(b, self.height * self.width)
 
 
 class LSTMCSVFolderModel:
@@ -66,6 +102,7 @@ class LSTMCSVFolderModel:
         epochs: int = 5,
         lr: float = 0.001,
         batch_size: int = 4,
+        kernel_size: int = 3,
         device=None,
     ):
         self.seq_length = seq_length
@@ -73,7 +110,8 @@ class LSTMCSVFolderModel:
         self.epochs = epochs
         self.lr = lr
         self.batch_size = batch_size
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.kernel_size = kernel_size
+        self.device = device or torch.device("cpu")
         self.model = None
         self.temp_min = None
         self.temp_max = None
@@ -129,7 +167,9 @@ class LSTMCSVFolderModel:
         train_data = seqs[:-1]
         loader = DataLoader(train_data, batch_size=self.batch_size, shuffle=False)
 
-        self.model = _ThermalNet(self.flat_size, self.hidden_size, self.flat_size).to(self.device)
+        self.model = _ThermalNet(
+            self.height, self.width, self.hidden_size, self.kernel_size
+        ).to(self.device)
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         loss_fn = nn.MSELoss()
 
@@ -169,6 +209,7 @@ class LSTMCSVFolderModel:
                 "epochs": self.epochs,
                 "lr": self.lr,
                 "batch_size": self.batch_size,
+                "kernel_size": self.kernel_size,
             },
             "norm": {"temp_min": self.temp_min, "temp_max": self.temp_max},
             "shape": {"height": self.height, "width": self.width, "flat_size": self.flat_size},
@@ -182,12 +223,15 @@ class LSTMCSVFolderModel:
         self.epochs = h["epochs"]
         self.lr = h["lr"]
         self.batch_size = h["batch_size"]
+        self.kernel_size = h.get("kernel_size", 3)
         self.temp_min = ckpt["norm"]["temp_min"]
         self.temp_max = ckpt["norm"]["temp_max"]
         self.height = ckpt["shape"]["height"]
         self.width = ckpt["shape"]["width"]
         self.flat_size = ckpt["shape"]["flat_size"]
-        self.model = _ThermalNet(self.flat_size, self.hidden_size, self.flat_size).to(self.device)
+        self.model = _ThermalNet(
+            self.height, self.width, self.hidden_size, self.kernel_size
+        ).to(self.device)
         self.model.load_state_dict(ckpt["state_dict"])
         self.model.eval()
 
@@ -197,6 +241,7 @@ class LSTMCSVFolderModel:
         target_timestamp=None,
         save_csv_path: str = None,
         save_jpg_path: str = None,
+        save_comparison_jpg_path: str = None,
     ) -> dict:
         if self.model is None:
             raise RuntimeError("Modelo não treinado. Execute /train primeiro.")
@@ -264,6 +309,12 @@ class LSTMCSVFolderModel:
             seq_test, label_real = seqs[-1]
             target_ts = self.timestamps[-1] if self.timestamps else None
 
+        if save_comparison_jpg_path and is_synthetic:
+            raise ValueError(
+                "Comparação real vs previsto indisponível: timestamp solicitado é "
+                "sintético (não há frame real correspondente para comparar)."
+            )
+
         self.model.eval()
         with torch.no_grad():
             if is_synthetic and n_steps > 1:
@@ -309,7 +360,7 @@ class LSTMCSVFolderModel:
 
         fig, ax = plt.subplots(figsize=(8, 6))
         im = ax.imshow(mat_pred, cmap='turbo')
-        ax.set_title(f"Previsão LSTM — {ts_str}{title_metric}")
+        ax.set_title(f"Previsão ConvLSTM — {ts_str}{title_metric}")
         ax.axis('off')
         plt.colorbar(im, ax=ax, label='Temperatura')
 
@@ -319,6 +370,31 @@ class LSTMCSVFolderModel:
             result["jpg_saved_to"] = save_jpg_path
 
         result["plot_base64"] = _fig_to_base64(fig, fmt='jpg')
+
+        if save_comparison_jpg_path and label_real is not None:
+            mat_real_cmp = denorm(label_real)
+            err_cmp = np.abs(mat_real_cmp - mat_pred)
+            vmin = float(min(mat_real_cmp.min(), mat_pred.min()))
+            vmax = float(max(mat_real_cmp.max(), mat_pred.max()))
+            fig_cmp, axes = plt.subplots(1, 3, figsize=(18, 6))
+            im0 = axes[0].imshow(mat_real_cmp, cmap='turbo', vmin=vmin, vmax=vmax)
+            axes[0].set_title('Real')
+            axes[0].axis('off')
+            plt.colorbar(im0, ax=axes[0], label='Temperatura', shrink=0.85)
+            im1 = axes[1].imshow(mat_pred, cmap='turbo', vmin=vmin, vmax=vmax)
+            axes[1].set_title('Previsto')
+            axes[1].axis('off')
+            plt.colorbar(im1, ax=axes[1], label='Temperatura', shrink=0.85)
+            im2 = axes[2].imshow(err_cmp, cmap='inferno', vmin=0)
+            axes[2].set_title(f'Erro |real - prev|  (max={err_cmp.max():.2f})')
+            axes[2].axis('off')
+            plt.colorbar(im2, ax=axes[2], label='Erro absoluto', shrink=0.85)
+            fig_cmp.suptitle(f"Comparação ConvLSTM — {ts_str} | MAE={result['mae']:.2f} | RMSE={result['rmse']:.2f}")
+            os.makedirs(os.path.dirname(save_comparison_jpg_path), exist_ok=True)
+            fig_cmp.savefig(save_comparison_jpg_path, format='jpg', bbox_inches='tight')
+            plt.close(fig_cmp)
+            result["comparison_jpg_saved_to"] = save_comparison_jpg_path
+
         return result
 
     def predict_stacked(
@@ -328,6 +404,8 @@ class LSTMCSVFolderModel:
         save_jpg_path: str = None,
         save_error_jpg_path: str = None,
         save_temp_jpg_path: str = None,
+        save_synthetics_folder: str = None,
+        save_comparison_jpg_path: str = None,
         n_synthetic_between: int = 3,
     ) -> dict:
         if self.model is None:
@@ -508,4 +586,90 @@ class LSTMCSVFolderModel:
 
         plt.close(fig_temp)
         result["n_synthetic_between"] = n_synthetic_between
+
+        if save_synthetics_folder:
+            interleaved_ts = []
+            real_ts_idx = 0
+            syn_idx = 0
+            for k, is_real in enumerate(is_real_mask):
+                if is_real:
+                    interleaved_ts.append(pred_timestamps[real_ts_idx]
+                                           if real_ts_idx < len(pred_timestamps) else None)
+                    real_ts_idx += 1
+                    syn_idx = 0
+                else:
+                    syn_idx += 1
+                    prev_ts = pred_timestamps[real_ts_idx - 1] if real_ts_idx - 1 < len(pred_timestamps) else None
+                    next_ts = pred_timestamps[real_ts_idx] if real_ts_idx < len(pred_timestamps) else None
+                    if prev_ts and next_ts:
+                        delta = (next_ts - prev_ts) / (n_synthetic_between + 1)
+                        interleaved_ts.append(prev_ts + delta * syn_idx)
+                    else:
+                        interleaved_ts.append(None)
+
+            def _ts_tag(ts):
+                return ts.strftime('%Y%m%d-%H%M') if ts else 'NA'
+
+            first_ts = next((t for t in interleaved_ts if t is not None), None)
+            last_ts = next((t for t in reversed(interleaved_ts) if t is not None), None)
+            interval_tag = f"{_ts_tag(first_ts)}_to_{_ts_tag(last_ts)}" if first_ts else f"N{len(interleaved_d)}"
+            out_dir = os.path.join(save_synthetics_folder, f"stacked_{interval_tag}")
+            os.makedirs(out_dir, exist_ok=True)
+
+            vmin_all, vmax_all = float(interleaved_d.min()), float(interleaved_d.max())
+            for k, (frame, ts, is_real) in enumerate(zip(interleaved_d, interleaved_ts, is_real_mask)):
+                kind = 'real' if is_real else 'syn'
+                ts_label = ts.strftime('%Y-%m-%d %H:%M') if ts else f'idx={k}'
+                fig_one, ax_one = plt.subplots(figsize=(8, 6))
+                im_one = ax_one.imshow(frame, cmap='turbo', vmin=vmin_all, vmax=vmax_all)
+                ax_one.set_title(f"[{kind.upper()}] {ts_label}")
+                ax_one.axis('off')
+                plt.colorbar(im_one, ax=ax_one, label='Temperatura')
+                fname = f"frame_{k:04d}_{kind}_{_ts_tag(ts)}.jpg"
+                fig_one.savefig(os.path.join(out_dir, fname), format='jpg', bbox_inches='tight')
+                plt.close(fig_one)
+
+            result["synthetics_saved_to"] = out_dir
+            result["synthetics_count"] = int(len(interleaved_d))
+
+        if save_comparison_jpg_path:
+            n_cmp = min(8, preds_d.shape[0])
+            cmp_idx = np.linspace(0, preds_d.shape[0] - 1, n_cmp, dtype=int)
+            fig_cmp, axes = plt.subplots(n_cmp, 3, figsize=(15, 4 * n_cmp))
+            if n_cmp == 1:
+                axes = axes.reshape(1, 3)
+            for row, idx in enumerate(cmp_idx):
+                real_f = actuals_d[idx]
+                pred_f = preds_d[idx]
+                err_f = np.abs(real_f - pred_f)
+                vmin_pair = float(min(real_f.min(), pred_f.min()))
+                vmax_pair = float(max(real_f.max(), pred_f.max()))
+                ts = pred_timestamps[idx] if idx < len(pred_timestamps) and pred_timestamps[idx] else f"idx={idx}"
+                ts_label = ts.strftime('%Y-%m-%d %H:%M') if hasattr(ts, 'strftime') else ts
+
+                im_r = axes[row, 0].imshow(real_f, cmap='turbo', vmin=vmin_pair, vmax=vmax_pair)
+                axes[row, 0].set_title(f"Real — {ts_label}")
+                axes[row, 0].axis('off')
+                plt.colorbar(im_r, ax=axes[row, 0], shrink=0.85)
+
+                im_p = axes[row, 1].imshow(pred_f, cmap='turbo', vmin=vmin_pair, vmax=vmax_pair)
+                axes[row, 1].set_title(f"Previsto — MAE={err_f.mean():.2f}")
+                axes[row, 1].axis('off')
+                plt.colorbar(im_p, ax=axes[row, 1], shrink=0.85)
+
+                im_e = axes[row, 2].imshow(err_f, cmap='inferno', vmin=0)
+                axes[row, 2].set_title(f"Erro |R-P| — max={err_f.max():.2f}")
+                axes[row, 2].axis('off')
+                plt.colorbar(im_e, ax=axes[row, 2], shrink=0.85)
+
+            fig_cmp.suptitle(
+                f"Comparação real vs previsto ({n_cmp} amostras de {preds_d.shape[0]}) — "
+                f"MAE global={mae:.2f} | RMSE global={rmse:.2f}"
+            )
+            fig_cmp.tight_layout()
+            os.makedirs(os.path.dirname(save_comparison_jpg_path), exist_ok=True)
+            fig_cmp.savefig(save_comparison_jpg_path, format='jpg', bbox_inches='tight')
+            plt.close(fig_cmp)
+            result["comparison_jpg_saved_to"] = save_comparison_jpg_path
+
         return result
