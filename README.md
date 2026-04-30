@@ -1,6 +1,8 @@
-# LSTM Thermal CSV Folder API
+# ConvLSTM Thermal CSV Folder API
 
-API REST que treina um LSTM sobre uma pasta de CSVs (cada CSV = uma matriz térmica / um frame) e prevê o próximo frame da sequência.
+API REST que treina um ConvLSTM sobre uma pasta de CSVs (cada CSV = uma matriz térmica / um frame) e prevê o próximo frame da sequência. A arquitetura usa convoluções 2D nas portas do LSTM, preservando a estrutura espacial dos frames em vez de achatá-los.
+
+O hiperparâmetro `hidden_size` da request `/train` passa a controlar o número de canais ocultos do ConvLSTM (kernel 3×3 fixo).
 
 ## Endpoints
 

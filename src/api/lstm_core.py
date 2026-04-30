@@ -45,15 +45,51 @@ def _fig_to_base64(fig, fmt: str = 'jpg') -> str:
     return encoded
 
 
-class _ThermalNet(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, output_size: int):
+class _ConvLSTMCell(nn.Module):
+    def __init__(self, input_channels: int, hidden_channels: int, kernel_size: int = 3):
         super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
-        self.linear = nn.Linear(hidden_size, output_size)
+        self.hidden_channels = hidden_channels
+        padding = kernel_size // 2
+        self.conv = nn.Conv2d(
+            input_channels + hidden_channels,
+            4 * hidden_channels,
+            kernel_size,
+            padding=padding,
+        )
+
+    def forward(self, x, h, c):
+        gates = self.conv(torch.cat([x, h], dim=1))
+        i, f, o, g = torch.split(gates, self.hidden_channels, dim=1)
+        i = torch.sigmoid(i)
+        f = torch.sigmoid(f)
+        o = torch.sigmoid(o)
+        g = torch.tanh(g)
+        c = f * c + i * g
+        h = o * torch.tanh(c)
+        return h, c
+
+
+class _ThermalNet(nn.Module):
+    """ConvLSTM mantendo o contrato (batch, seq, H*W) -> (batch, H*W)."""
+
+    def __init__(self, height: int, width: int, hidden_channels: int, kernel_size: int = 3):
+        super().__init__()
+        self.height = height
+        self.width = width
+        self.hidden_channels = hidden_channels
+        self.cell = _ConvLSTMCell(1, hidden_channels, kernel_size)
+        self.out_conv = nn.Conv2d(
+            hidden_channels, 1, kernel_size, padding=kernel_size // 2
+        )
 
     def forward(self, x):
-        out, _ = self.lstm(x)
-        return self.linear(out[:, -1, :])
+        b, s, _ = x.shape
+        x = x.reshape(b, s, 1, self.height, self.width)
+        h = torch.zeros(b, self.hidden_channels, self.height, self.width, device=x.device)
+        c = torch.zeros_like(h)
+        for t in range(s):
+            h, c = self.cell(x[:, t], h, c)
+        return self.out_conv(h).reshape(b, self.height * self.width)
 
 
 class LSTMCSVFolderModel:
@@ -73,7 +109,7 @@ class LSTMCSVFolderModel:
         self.epochs = epochs
         self.lr = lr
         self.batch_size = batch_size
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or torch.device("cpu")
         self.model = None
         self.temp_min = None
         self.temp_max = None
@@ -129,7 +165,7 @@ class LSTMCSVFolderModel:
         train_data = seqs[:-1]
         loader = DataLoader(train_data, batch_size=self.batch_size, shuffle=False)
 
-        self.model = _ThermalNet(self.flat_size, self.hidden_size, self.flat_size).to(self.device)
+        self.model = _ThermalNet(self.height, self.width, self.hidden_size).to(self.device)
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         loss_fn = nn.MSELoss()
 
@@ -187,7 +223,7 @@ class LSTMCSVFolderModel:
         self.height = ckpt["shape"]["height"]
         self.width = ckpt["shape"]["width"]
         self.flat_size = ckpt["shape"]["flat_size"]
-        self.model = _ThermalNet(self.flat_size, self.hidden_size, self.flat_size).to(self.device)
+        self.model = _ThermalNet(self.height, self.width, self.hidden_size).to(self.device)
         self.model.load_state_dict(ckpt["state_dict"])
         self.model.eval()
 
@@ -309,7 +345,7 @@ class LSTMCSVFolderModel:
 
         fig, ax = plt.subplots(figsize=(8, 6))
         im = ax.imshow(mat_pred, cmap='turbo')
-        ax.set_title(f"Previsão LSTM — {ts_str}{title_metric}")
+        ax.set_title(f"Previsão ConvLSTM — {ts_str}{title_metric}")
         ax.axis('off')
         plt.colorbar(im, ax=ax, label='Temperatura')
 

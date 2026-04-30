@@ -18,11 +18,11 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 MODEL_PATH = os.path.join(PROJECT_ROOT, "results", "models", "lstm_csv_folder.pt")
 
 app = FastAPI(
-    title="LSTM Thermal CSV Folder API",
+    title="ConvLSTM Thermal CSV Folder API",
     description=(
         "API para treinar e prever matrizes térmicas a partir de uma pasta de CSVs.\n\n"
-        "Cada CSV na pasta representa uma matriz térmica (um frame). O LSTM aprende a "
-        "sequência temporal e prevê o próximo frame.\n\n"
+        "Cada CSV na pasta representa uma matriz térmica (um frame). O ConvLSTM aprende a "
+        "sequência temporal preservando a estrutura espacial 2D e prevê o próximo frame.\n\n"
         "**Endpoints:** `POST /train`, `POST /predict` e `POST /predict_stacked`."
     ),
     version="1.0.0",
@@ -47,6 +47,10 @@ class TrainRequest(BaseModel):
     epochs: int = Field(default=5, ge=1)
     lr: float = Field(default=0.001, gt=0)
     batch_size: int = Field(default=4, ge=1)
+    device: Optional[str] = Field(
+        default=None,
+        description="'cuda' ou 'cpu'. None usa o padrão da classe (cpu).",
+    )
 
 
 class PredictRequest(BaseModel):
@@ -85,6 +89,7 @@ def train(req: TrainRequest):
         epochs=req.epochs,
         lr=req.lr,
         batch_size=req.batch_size,
+        device=req.device,
     )
     try:
         result = _model.train(folder)
