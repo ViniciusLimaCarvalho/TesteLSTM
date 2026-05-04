@@ -6,5 +6,5 @@ services:
     volumes:
       - ./data:/app/data
       - ./results:/app/results
-      - /home/grva/AutoinspectionPath:/app/autoinspection
+      - /home/grva/Documents/imagens_convertidas/prediction:/app/prediction
     restart: unless-stopped
