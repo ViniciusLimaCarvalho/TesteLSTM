@@ -167,7 +167,7 @@ def predict(req: PredictRequest):
 
     csv_path = jpg_path = comparison_path = None
     if req.save_outputs:
-        csv_path = os.path.join(PROJECT_ROOT, "results", "predictions", "previsao_csv_folder.csv")
+        csv_path = os.path.join("home", "grva", "AutoinspectionPath")
         jpg_path = os.path.join(PROJECT_ROOT, "results", "figures", "previsao_csv_folder.jpg")
     if req.save_comparison:
         comparison_path = os.path.join(
