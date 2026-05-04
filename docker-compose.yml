@@ -6,4 +6,5 @@ services:
     volumes:
       - ./data:/app/data
       - ./results:/app/results
+      - /home/grva/AutoinspectionPath:/app/autoinspection
     restart: unless-stopped
