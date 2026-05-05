@@ -6,13 +6,17 @@ O hiperparâmetro `hidden_size` da request `/train` passa a controlar o número 
 
 ## Endpoints
 
-- `POST /train` — treina o modelo com os CSVs da pasta. Salva os pesos em `results/models/lstm_csv_folder.pt`.
-- `POST /predict` — prevê um frame. Salva CSV (`results/predictions/`) e heatmap turbo JPG (`results/figures/`).
+- `POST /train` — treina o modelo com os CSVs da pasta. Salva os pesos em `results/models/{nome_da_pasta}.pt` (um arquivo por módulo).
+- `POST /predict` — prevê um frame. Por padrão, salva o CSV em `/app/prediction/` com o nome no mesmo formato dos CSVs de treino (ex.: `1_3_20260108_020000000_VBY_V3.A1_1.csv`) e o heatmap turbo em `results/figures/`. Use `csv_output_path` para sobrescrever o destino.
 - `POST /predict_stacked` — prevê todas as sequências possíveis e empilha os frames previstos verticalmente em um único CSV + grid de heatmaps JPG. Também salva um gráfico de erro (MAE) por amostra de tempo em `results/figures/erro_csv_folder_stacked.jpg`.
 
 ## Persistência
 
-O modelo treinado é gravado em `results/models/lstm_csv_folder.pt` e recarregado automaticamente no startup da API. Como `./results` é volume Docker, o modelo persiste entre `docker-compose down/up`.
+Cada módulo treinado tem seu próprio checkpoint em `results/models/{nome_da_pasta}.pt` (ex.: `V3.A1_CSV.pt`, `V4.A12_CSV.pt`). Os modelos são carregados sob demanda em um cache LRU em memória (até 5 modelos simultâneos), com fallback automático para o disco. Como `./results` é volume Docker, os pesos persistem entre `docker-compose down/up`.
+
+## Hiperparâmetros via Optuna
+
+A request `/train` aceita `use_optuna_params: true`, que sobrescreve `seq_length`, `hidden_size`, `epochs`, `lr`, `batch_size` e `kernel_size` com os valores em `results/optuna/best_params.json` (gerados pelo último run de `python -m src.optim.tune_optuna`). `folder` e `device` continuam vindo do request.
 
 ## Timestamp
 
@@ -78,6 +82,7 @@ data/
   raw/V3.A1_CSV/ # CSVs de entrada (cada CSV = uma matriz térmica)
 results/
   figures/       # JPGs com heatmaps turbo
-  predictions/   # CSVs previstos
-  models/        # Checkpoint do LSTM treinado (.pt)
+  predictions/   # CSVs previstos (quando csv_output_path não é informado e /app/prediction não existe)
+  models/        # Um .pt por módulo treinado
+  optuna/        # best_params.json gerado pelo tune_optuna
 ```
