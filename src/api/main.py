@@ -5,6 +5,7 @@ import sys
 import os
 import json
 from collections import OrderedDict
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
@@ -14,11 +15,12 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from lstm_core import LSTMCSVFolderModel
+from lstm_core import LSTMCSVFolderModel, _parse_timestamp
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 MODELS_DIR = os.path.join(PROJECT_ROOT, "results", "models")
 OPTUNA_BEST_PARAMS_PATH = os.path.join(PROJECT_ROOT, "results", "optuna", "best_params.json")
+DEFAULT_PREDICTION_DIR = "/app/prediction"
 _TRAINABLE_KEYS = {"seq_length", "hidden_size", "epochs", "lr", "batch_size", "kernel_size"}
 MAX_CACHED_MODELS = 5
 
@@ -113,27 +115,60 @@ class PredictRequest(BaseModel):
         default=False,
         description=(
             "Salva imagem extra (real | previsto | erro por pixel). "
-            "No /predict, retorna 400 se o timestamp solicitado for sintético (sem frame real)."
-        ),
-    )
-    save_synthetics: bool = Field(
-        default=False,
-        description=(
-            "Apenas /predict_stacked: salva cada frame interleaved (reais + 3 sintéticas entre cada par) "
-            "como JPG individual numa subpasta de results/figures/ identificada pelo intervalo previsto."
+            "Retorna 400 se o timestamp solicitado for sintético (sem frame real)."
         ),
     )
     csv_output_path: Optional[str] = Field(
         default=None,
         description=(
-            "Caminho absoluto onde o CSV previsto será salvo (ex.: '/app/autoinspection/previsao.csv'). "
-            "Se não informado, salva em results/predictions/ dentro do container."
+            "Caminho absoluto onde o CSV previsto será salvo. "
+            "Se não informado, salva em /app/prediction/ com o nome no mesmo formato dos CSVs de "
+            "treinamento (ex.: '1_3_20260108_020000000_VBY_V3.A1_1.csv')."
+        ),
+    )
+
+
+class PredictStackedRequest(PredictRequest):
+    save_synthetics: bool = Field(
+        default=False,
+        description=(
+            "Salva cada frame interleaved (reais + 3 sintéticas entre cada par) como JPG "
+            "individual numa subpasta de results/figures/ identificada pelo intervalo previsto."
         ),
     )
 
 
 def _resolve(path: str) -> str:
     return path if os.path.isabs(path) else os.path.join(PROJECT_ROOT, path)
+
+
+def _default_predict_csv_path(folder: str, target_timestamp: Optional[str]) -> str:
+    """Gera caminho padrão em /app/prediction com nome no mesmo formato dos CSVs de treino."""
+    files = sorted(f for f in os.listdir(folder) if f.lower().endswith('.csv'))
+    if not files:
+        raise HTTPException(status_code=404, detail=f"Nenhum CSV em {folder}")
+
+    sample = files[-1]
+    parts = sample.split('_')
+    fallback = os.path.join(PROJECT_ROOT, "results", "predictions", "previsao.csv")
+    if len(parts) < 5:
+        return fallback
+
+    if target_timestamp:
+        try:
+            ts = datetime.fromisoformat(target_timestamp.replace(' ', 'T'))
+        except ValueError:
+            return fallback
+    else:
+        ts = _parse_timestamp(sample)
+        if ts is None:
+            return fallback
+
+    date_str = ts.strftime('%Y%m%d')
+    time_str = ts.strftime('%H%M00000')
+    new_parts = parts[:2] + [date_str, time_str] + parts[4:]
+    filename = '_'.join(new_parts)
+    return os.path.join(DEFAULT_PREDICTION_DIR, filename)
 
 
 def _load_optuna_best() -> dict:
@@ -207,7 +242,7 @@ def predict(req: PredictRequest):
 
     csv_path = jpg_path = comparison_path = None
     if req.save_outputs:
-        csv_path = req.csv_output_path or os.path.join(PROJECT_ROOT, "results", "predictions", "previsao.csv")
+        csv_path = req.csv_output_path or _default_predict_csv_path(folder, req.target_timestamp)
         jpg_path = os.path.join(PROJECT_ROOT, "results", "figures", "previsao_csv_folder.jpg")
     if req.save_comparison:
         comparison_path = os.path.join(
@@ -229,7 +264,7 @@ def predict(req: PredictRequest):
 
 
 @app.post("/predict_stacked")
-def predict_stacked(req: PredictRequest):
+def predict_stacked(req: PredictStackedRequest):
     """Gera previsões para todas as sequências e empilha verticalmente em um único CSV.
     Salva o CSV empilhado e um JPG com grid de heatmaps turbo dos frames previstos."""
     folder = _resolve(req.folder)

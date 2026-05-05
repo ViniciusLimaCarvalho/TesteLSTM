@@ -3,4 +3,6 @@ __pycache__/
 .venv/
 .idea/
 *.egg-info/
-results/
+results/*
+!results/models/
+data/raw/*_CSV/
