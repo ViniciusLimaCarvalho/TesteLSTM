@@ -301,6 +301,27 @@ def predict_stacked(req: PredictStackedRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class ReportRequest(BaseModel):
+    folder: str = Field(default="data/raw/V3.A1_CSV")
+    n_worst: int = Field(default=5, ge=1, le=20, description="Número de piores frames no painel de comparação.")
+
+
+@app.post("/report")
+def report(req: ReportRequest):
+    """Gera relatório completo: 5 gráficos de análise salvos em results/figures/."""
+    folder = _resolve(req.folder)
+    if not os.path.isdir(folder):
+        raise HTTPException(status_code=404, detail=f"Pasta não encontrada: {folder}")
+
+    model = _get_model(folder)
+    save_dir = os.path.join(PROJECT_ROOT, "results", "figures")
+
+    try:
+        return model.generate_report(folder, save_dir=save_dir, n_worst=req.n_worst)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
