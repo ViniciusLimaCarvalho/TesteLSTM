@@ -673,3 +673,219 @@ class LSTMCSVFolderModel:
             result["comparison_jpg_saved_to"] = save_comparison_jpg_path
 
         return result
+
+    def generate_report(
+        self,
+        folder: str,
+        save_dir: str = None,
+        n_worst: int = 5,
+    ) -> dict:
+        """Gera relatório completo com 5 gráficos de análise de qualidade das predições."""
+        if self.model is None:
+            raise RuntimeError("Modelo não treinado. Execute /train primeiro.")
+
+        data = self._load_folder(folder)
+        flat = self._normalize(data)
+        seqs = self._make_sequences(flat)
+        if not seqs:
+            raise ValueError("Frames insuficientes para análise.")
+
+        preds, actuals = [], []
+        self.model.eval()
+        with torch.no_grad():
+            for seq, label in seqs:
+                pred = self.model(seq.unsqueeze(0).to(self.device))
+                preds.append(pred.detach().cpu().reshape(self.height, self.width).numpy())
+                actuals.append(label.detach().cpu().reshape(self.height, self.width).numpy())
+
+        scale = self.temp_max - self.temp_min
+        preds_d = np.stack([((p + 1) / 2) * scale + self.temp_min for p in preds])
+        actuals_d = np.stack([((a + 1) / 2) * scale + self.temp_min for a in actuals])
+
+        error = np.abs(actuals_d - preds_d)
+        mae_per_frame = error.mean(axis=(1, 2))
+        mae = float(mae_per_frame.mean())
+        rmse = float(np.sqrt(np.mean((actuals_d - preds_d) ** 2)))
+
+        p50 = float(np.percentile(mae_per_frame, 50))
+        p75 = float(np.percentile(mae_per_frame, 75))
+        p90 = float(np.percentile(mae_per_frame, 90))
+        p95 = float(np.percentile(mae_per_frame, 95))
+        n_anomalous = int(np.sum(mae_per_frame > p90))
+
+        pred_timestamps = self.timestamps[self.seq_length:] if self.timestamps else []
+        n_worst = min(n_worst, len(preds_d))
+        worst_idx = np.argsort(mae_per_frame)[-n_worst:][::-1]
+
+        result = {
+            "n_predictions": len(preds_d),
+            "mae": round(mae, 4),
+            "rmse": round(rmse, 4),
+            "mae_percentiles": {"p50": round(p50, 4), "p75": round(p75, 4),
+                                "p90": round(p90, 4), "p95": round(p95, 4)},
+            "n_outlier_frames_above_p90": n_anomalous,
+            "worst_frames": [
+                {
+                    "rank": i + 1,
+                    "frame_index": int(idx),
+                    "timestamp": (pred_timestamps[idx].isoformat()
+                                  if idx < len(pred_timestamps) and pred_timestamps[idx] else None),
+                    "mae": round(float(mae_per_frame[idx]), 4),
+                }
+                for i, idx in enumerate(worst_idx)
+            ],
+            "graphs_saved": {},
+        }
+
+        def _save(fig, name):
+            if save_dir:
+                os.makedirs(save_dir, exist_ok=True)
+                path = os.path.join(save_dir, name)
+                fig.savefig(path, format='jpg', bbox_inches='tight', dpi=120)
+                result["graphs_saved"][name.replace('.jpg', '')] = path
+            plt.close(fig)
+
+        # --- Gráfico 1: Piores frames (real | previsto | erro) ---
+        fig1, axes1 = plt.subplots(n_worst, 3, figsize=(15, 4.5 * n_worst))
+        if n_worst == 1:
+            axes1 = axes1.reshape(1, 3)
+        for row, idx in enumerate(worst_idx):
+            real_f = actuals_d[idx]
+            pred_f = preds_d[idx]
+            err_f = error[idx]
+            vmin_p = float(min(real_f.min(), pred_f.min()))
+            vmax_p = float(max(real_f.max(), pred_f.max()))
+            ts = pred_timestamps[idx] if idx < len(pred_timestamps) else None
+            ts_label = ts.strftime('%Y-%m-%d %H:%M') if ts else f"índice {idx}"
+
+            im_r = axes1[row, 0].imshow(real_f, cmap='turbo', vmin=vmin_p, vmax=vmax_p)
+            axes1[row, 0].set_title(f"Real — {ts_label}", fontsize=10)
+            axes1[row, 0].axis('off')
+            plt.colorbar(im_r, ax=axes1[row, 0], shrink=0.85, label='°C')
+
+            im_p = axes1[row, 1].imshow(pred_f, cmap='turbo', vmin=vmin_p, vmax=vmax_p)
+            axes1[row, 1].set_title(f"Previsto — MAE={mae_per_frame[idx]:.2f} °C", fontsize=10)
+            axes1[row, 1].axis('off')
+            plt.colorbar(im_p, ax=axes1[row, 1], shrink=0.85, label='°C')
+
+            im_e = axes1[row, 2].imshow(err_f, cmap='inferno', vmin=0)
+            axes1[row, 2].set_title(f"Erro |Real−Prev| — max={err_f.max():.2f} °C", fontsize=10)
+            axes1[row, 2].axis('off')
+            plt.colorbar(im_e, ax=axes1[row, 2], shrink=0.85, label='°C')
+
+        fig1.suptitle(
+            f"Top {n_worst} frames com maior erro de predição\n"
+            "Possível inconsistência entre nome do arquivo e dado real — verificar com o cliente",
+            fontsize=13, fontweight='bold', color='#c0392b',
+        )
+        fig1.tight_layout(rect=[0, 0, 1, 0.96])
+        _save(fig1, "report_01_piores_frames.jpg")
+
+        # --- Gráfico 2: Histograma de distribuição de MAE ---
+        fig2, ax2 = plt.subplots(figsize=(10, 5))
+        ax2.hist(mae_per_frame, bins=min(40, max(10, len(mae_per_frame) // 3)),
+                 color='#3498db', alpha=0.75, edgecolor='white', label='Frames')
+        ax2.axvline(mae, color='#27ae60', linestyle='--', linewidth=2,
+                    label=f'Média: {mae:.2f} °C')
+        ax2.axvline(p50, color='#2980b9', linestyle=':', linewidth=1.5,
+                    label=f'P50: {p50:.2f} °C')
+        ax2.axvline(p90, color='#e67e22', linestyle='--', linewidth=2,
+                    label=f'P90: {p90:.2f} °C')
+        ax2.axvline(p95, color='#e74c3c', linestyle='--', linewidth=2,
+                    label=f'P95: {p95:.2f} °C')
+        ax2.axvspan(p90, float(mae_per_frame.max()), alpha=0.12, color='#e74c3c',
+                    label=f'{n_anomalous} frame(s) acima do P90')
+        ax2.set_xlabel('MAE por frame (°C)', fontsize=12)
+        ax2.set_ylabel('Número de frames', fontsize=12)
+        ax2.set_title(
+            f'Distribuição do erro de predição — {len(mae_per_frame)} frames\n'
+            'Erro concentrado em poucos outliers indica possíveis inconsistências nos dados de origem',
+            fontsize=12,
+        )
+        ax2.legend(fontsize=10)
+        ax2.grid(True, alpha=0.3)
+        fig2.tight_layout()
+        _save(fig2, "report_02_distribuicao_mae.jpg")
+
+        # --- Gráfico 3: Mapa espacial de erro médio ---
+        spatial_error = error.mean(axis=0)
+        fig3, ax3 = plt.subplots(figsize=(10, 7))
+        im3 = ax3.imshow(spatial_error, cmap='inferno')
+        ax3.set_title(
+            'Mapa espacial do erro médio (todos os frames)\n'
+            'Regiões mais claras = maior dificuldade de predição nessa área do equipamento',
+            fontsize=12,
+        )
+        ax3.axis('off')
+        plt.colorbar(im3, ax=ax3, label='MAE médio por pixel (°C)')
+        fig3.tight_layout()
+        _save(fig3, "report_03_mapa_erro_espacial.jpg")
+
+        # --- Gráfico 4: Scatter temperatura real vs prevista ---
+        n_total = actuals_d.size
+        step = max(1, n_total // 80000)
+        real_flat = actuals_d.flatten()[::step]
+        pred_flat = preds_d.flatten()[::step]
+        r = float(np.corrcoef(real_flat, pred_flat)[0, 1])
+        r2 = r ** 2
+        lim_min = float(min(real_flat.min(), pred_flat.min()))
+        lim_max = float(max(real_flat.max(), pred_flat.max()))
+
+        fig4, ax4 = plt.subplots(figsize=(7, 7))
+        ax4.scatter(real_flat, pred_flat, alpha=0.04, s=1, color='#2980b9',
+                    rasterized=True, label='Pixels amostrados')
+        ax4.plot([lim_min, lim_max], [lim_min, lim_max], 'r--',
+                 linewidth=1.5, label='y = x (predição perfeita)')
+        ax4.set_xlabel('Temperatura real (°C)', fontsize=12)
+        ax4.set_ylabel('Temperatura prevista (°C)', fontsize=12)
+        ax4.set_title(
+            f'Correlação temperatura real vs prevista\nr = {r:.4f}  |  R² = {r2:.4f}',
+            fontsize=12,
+        )
+        ax4.legend(fontsize=10)
+        ax4.grid(True, alpha=0.3)
+        fig4.tight_layout()
+        _save(fig4, "report_04_scatter_real_previsto.jpg")
+
+        # --- Gráfico 5: Erro temporal com marcação de outliers ---
+        is_outlier = mae_per_frame > p90
+        x = np.arange(len(mae_per_frame))
+
+        fig5, ax5 = plt.subplots(figsize=(14, 5))
+        ax5.plot(x, mae_per_frame, linewidth=1.5, color='#2980b9', alpha=0.8,
+                 label='MAE por frame')
+        ax5.fill_between(x, mae_per_frame, alpha=0.12, color='#2980b9')
+        ax5.scatter(x[is_outlier], mae_per_frame[is_outlier], color='#e74c3c',
+                    s=70, zorder=5, marker='^',
+                    label=f'Outliers > P90 ({n_anomalous} frame(s))')
+        ax5.axhline(mae, color='#27ae60', linestyle='--', linewidth=1.5,
+                    label=f'MAE médio: {mae:.2f} °C')
+        ax5.axhline(p90, color='#e67e22', linestyle=':', linewidth=1.5,
+                    label=f'P90: {p90:.2f} °C')
+
+        if pred_timestamps and any(ts is not None for ts in pred_timestamps):
+            step_ts = max(1, len(x) // 14)
+            ax5.set_xticks(x[::step_ts])
+            ax5.set_xticklabels(
+                [pred_timestamps[i].strftime('%m-%d %H:%M') if pred_timestamps[i] else str(i)
+                 for i in range(0, len(pred_timestamps), step_ts)],
+                rotation=45, ha='right',
+            )
+            ax5.set_xlabel('Timestamp', fontsize=12)
+        else:
+            ax5.set_xlabel('Índice do frame', fontsize=12)
+
+        ax5.set_ylabel('MAE (°C)', fontsize=12)
+        ax5.set_title(
+            f'Erro de predição ao longo do tempo — {len(mae_per_frame)} frames\n'
+            'Triângulos vermelhos = frames com erro acima do P90 (possíveis inconsistências de nomenclatura)',
+            fontsize=12,
+        )
+        ax5.legend(fontsize=10)
+        ax5.grid(True, alpha=0.3)
+        fig5.tight_layout()
+        _save(fig5, "report_05_erro_temporal.jpg")
+
+        result["r_pearson"] = round(r, 4)
+        result["r2"] = round(r2, 4)
+        return result
