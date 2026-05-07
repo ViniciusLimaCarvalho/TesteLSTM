@@ -216,7 +216,7 @@ class LSTMCSVFolderModel:
         }, path)
 
     def load(self, path: str) -> None:
-        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        ckpt = torch.load(path, map_location=self.device, weights_only=True)
         h = ckpt["hyperparams"]
         self.seq_length = h["seq_length"]
         self.hidden_size = h["hidden_size"]

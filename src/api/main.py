@@ -40,7 +40,13 @@ _models: OrderedDict = OrderedDict()
 
 def _model_path(folder: str) -> str:
     name = os.path.basename(os.path.normpath(folder))
-    return os.path.join(MODELS_DIR, f"{name}.pt")
+    if not name or name in (".", "..") or "/" in name or "\\" in name:
+        raise HTTPException(status_code=400, detail=f"Nome de pasta inválido: {folder!r}")
+    path = os.path.realpath(os.path.join(MODELS_DIR, f"{name}.pt"))
+    models_root = os.path.realpath(MODELS_DIR)
+    if os.path.commonpath([path, models_root]) != models_root:
+        raise HTTPException(status_code=400, detail="Caminho de modelo fora de MODELS_DIR.")
+    return path
 
 
 def _get_model(folder: str) -> LSTMCSVFolderModel:
