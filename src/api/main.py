@@ -4,6 +4,8 @@ matplotlib.use('Agg')
 import sys
 import os
 import json
+from collections import OrderedDict
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
@@ -13,12 +15,14 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from lstm_core import LSTMCSVFolderModel
+from lstm_core import LSTMCSVFolderModel, _parse_timestamp
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-MODEL_PATH = os.path.join(PROJECT_ROOT, "results", "models", "lstm_csv_folder.pt")
+MODELS_DIR = os.path.join(PROJECT_ROOT, "results", "models")
 OPTUNA_BEST_PARAMS_PATH = os.path.join(PROJECT_ROOT, "results", "optuna", "best_params.json")
+DEFAULT_PREDICTION_DIR = "/app/prediction"
 _TRAINABLE_KEYS = {"seq_length", "hidden_size", "epochs", "lr", "batch_size", "kernel_size"}
+MAX_CACHED_MODELS = 5
 
 app = FastAPI(
     title="ConvLSTM Thermal CSV Folder API",
@@ -31,13 +35,45 @@ app = FastAPI(
     version="1.0.0",
 )
 
-_model = LSTMCSVFolderModel()
-if os.path.exists(MODEL_PATH):
+_models: OrderedDict = OrderedDict()
+
+
+def _model_path(folder: str) -> str:
+    name = os.path.basename(os.path.normpath(folder))
+    if not name or name in (".", "..") or "/" in name or "\\" in name:
+        raise HTTPException(status_code=400, detail=f"Nome de pasta inválido: {folder!r}")
+    path = os.path.realpath(os.path.join(MODELS_DIR, f"{name}.pt"))
+    models_root = os.path.realpath(MODELS_DIR)
+    if os.path.commonpath([path, models_root]) != models_root:
+        raise HTTPException(status_code=400, detail="Caminho de modelo fora de MODELS_DIR.")
+    return path
+
+
+def _get_model(folder: str) -> LSTMCSVFolderModel:
+    name = os.path.basename(os.path.normpath(folder))
+    if name in _models:
+        _models.move_to_end(name)
+        return _models[name]
+
+    path = _model_path(folder)
+    if not os.path.exists(path):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Modelo não treinado para '{name}'. Chame POST /train com folder='{folder}' primeiro.",
+        )
+    m = LSTMCSVFolderModel()
     try:
-        _model.load(MODEL_PATH)
-        print(f"[startup] Modelo carregado de {MODEL_PATH}")
+        m.load(path)
     except Exception as e:
-        print(f"[startup] Falha ao carregar {MODEL_PATH}: {e}")
+        raise HTTPException(status_code=500, detail=f"Falha ao carregar modelo '{name}': {e}")
+
+    _models[name] = m
+    if len(_models) > MAX_CACHED_MODELS:
+        evicted, _ = _models.popitem(last=False)
+        print(f"[cache] Modelo '{evicted}' removido do cache (limite {MAX_CACHED_MODELS})")
+    print(f"[load] Modelo '{name}' carregado de {path}")
+    return _models[name]
+
 
 
 class TrainRequest(BaseModel):
@@ -85,20 +121,60 @@ class PredictRequest(BaseModel):
         default=False,
         description=(
             "Salva imagem extra (real | previsto | erro por pixel). "
-            "No /predict, retorna 400 se o timestamp solicitado for sintético (sem frame real)."
+            "Retorna 400 se o timestamp solicitado for sintético (sem frame real)."
         ),
     )
+    csv_output_path: Optional[str] = Field(
+        default=None,
+        description=(
+            "Caminho absoluto onde o CSV previsto será salvo. "
+            "Se não informado, salva em /app/prediction/ com o nome no mesmo formato dos CSVs de "
+            "treinamento (ex.: '1_3_20260108_020000000_VBY_V3.A1_1.csv')."
+        ),
+    )
+
+
+class PredictStackedRequest(PredictRequest):
     save_synthetics: bool = Field(
         default=False,
         description=(
-            "Apenas /predict_stacked: salva cada frame interleaved (reais + 3 sintéticas entre cada par) "
-            "como JPG individual numa subpasta de results/figures/ identificada pelo intervalo previsto."
+            "Salva cada frame interleaved (reais + 3 sintéticas entre cada par) como JPG "
+            "individual numa subpasta de results/figures/ identificada pelo intervalo previsto."
         ),
     )
 
 
 def _resolve(path: str) -> str:
     return path if os.path.isabs(path) else os.path.join(PROJECT_ROOT, path)
+
+
+def _default_predict_csv_path(folder: str, target_timestamp: Optional[str]) -> str:
+    """Gera caminho padrão em /app/prediction com nome no mesmo formato dos CSVs de treino."""
+    files = sorted(f for f in os.listdir(folder) if f.lower().endswith('.csv'))
+    if not files:
+        raise HTTPException(status_code=404, detail=f"Nenhum CSV em {folder}")
+
+    sample = files[-1]
+    parts = sample.split('_')
+    fallback = os.path.join(PROJECT_ROOT, "results", "predictions", "previsao.csv")
+    if len(parts) < 5:
+        return fallback
+
+    if target_timestamp:
+        try:
+            ts = datetime.fromisoformat(target_timestamp.replace(' ', 'T'))
+        except ValueError:
+            return fallback
+    else:
+        ts = _parse_timestamp(sample)
+        if ts is None:
+            return fallback
+
+    date_str = ts.strftime('%Y%m%d')
+    time_str = ts.strftime('%H%M00000')
+    new_parts = parts[:2] + [date_str, time_str] + parts[4:]
+    filename = '_'.join(new_parts)
+    return os.path.join(DEFAULT_PREDICTION_DIR, filename)
 
 
 def _load_optuna_best() -> dict:
@@ -116,8 +192,7 @@ def _load_optuna_best() -> dict:
 
 @app.post("/train")
 def train(req: TrainRequest):
-    """Treina o LSTM com os CSVs da pasta informada."""
-    global _model
+    """Treina o ConvLSTM com os CSVs da pasta informada e salva o modelo com o nome do módulo."""
     folder = _resolve(req.folder)
     if not os.path.isdir(folder):
         raise HTTPException(status_code=404, detail=f"Pasta não encontrada: {folder}")
@@ -142,11 +217,18 @@ def train(req: TrainRequest):
             "saved_at": best.get("saved_at"),
         }
 
-    _model = LSTMCSVFolderModel(device=req.device, **hp)
+    name = os.path.basename(os.path.normpath(folder))
+    model = LSTMCSVFolderModel(device=req.device, **hp)
     try:
-        result = _model.train(folder)
-        _model.save(MODEL_PATH)
-        result["model_saved_to"] = MODEL_PATH
+        result = model.train(folder)
+        path = _model_path(folder)
+        model.save(path)
+        _models[name] = model
+        _models.move_to_end(name)
+        if len(_models) > MAX_CACHED_MODELS:
+            evicted, _ = _models.popitem(last=False)
+            print(f"[cache] Modelo '{evicted}' removido do cache (limite {MAX_CACHED_MODELS})")
+        result["model_saved_to"] = path
         result["hyperparams_used"] = hp
         if optuna_meta is not None:
             result["loaded_from_optuna"] = optuna_meta
@@ -158,16 +240,15 @@ def train(req: TrainRequest):
 @app.post("/predict")
 def predict(req: PredictRequest):
     """Gera a próxima matriz prevista. Salva CSV e JPG (heatmap turbo) em results/."""
-    if _model.model is None:
-        raise HTTPException(status_code=400, detail="Modelo não treinado. Chame POST /train primeiro.")
-
     folder = _resolve(req.folder)
     if not os.path.isdir(folder):
         raise HTTPException(status_code=404, detail=f"Pasta não encontrada: {folder}")
 
+    model = _get_model(folder)
+
     csv_path = jpg_path = comparison_path = None
     if req.save_outputs:
-        csv_path = os.path.join(PROJECT_ROOT, "results", "predictions", "previsao_csv_folder.csv")
+        csv_path = req.csv_output_path or _default_predict_csv_path(folder, req.target_timestamp)
         jpg_path = os.path.join(PROJECT_ROOT, "results", "figures", "previsao_csv_folder.jpg")
     if req.save_comparison:
         comparison_path = os.path.join(
@@ -175,7 +256,7 @@ def predict(req: PredictRequest):
         )
 
     try:
-        return _model.predict(
+        return model.predict(
             folder,
             target_timestamp=req.target_timestamp,
             save_csv_path=csv_path,
@@ -189,15 +270,14 @@ def predict(req: PredictRequest):
 
 
 @app.post("/predict_stacked")
-def predict_stacked(req: PredictRequest):
+def predict_stacked(req: PredictStackedRequest):
     """Gera previsões para todas as sequências e empilha verticalmente em um único CSV.
     Salva o CSV empilhado e um JPG com grid de heatmaps turbo dos frames previstos."""
-    if _model.model is None:
-        raise HTTPException(status_code=400, detail="Modelo não treinado. Chame POST /train primeiro.")
-
     folder = _resolve(req.folder)
     if not os.path.isdir(folder):
         raise HTTPException(status_code=404, detail=f"Pasta não encontrada: {folder}")
+
+    model = _get_model(folder)
 
     csv_path = jpg_path = error_jpg_path = temp_jpg_path = None
     synthetics_folder = comparison_path = None
@@ -214,7 +294,7 @@ def predict_stacked(req: PredictRequest):
         )
 
     try:
-        return _model.predict_stacked(
+        return model.predict_stacked(
             folder,
             save_csv_path=csv_path,
             save_jpg_path=jpg_path,
